@@ -1,0 +1,8 @@
+{
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:eval": "RUN_LLM_EVALS=true LLM_JUDGE_MODEL=qwen3 vitest run tests/evals"
+  }
+}
