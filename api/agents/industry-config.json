@@ -1,0 +1,31 @@
+{
+  "skillSynonyms": {
+    "leadership": ["lead", "manag", "direct", "supervis", "head", "chief", "vp", "execut"],
+    "communication": ["present", "negoti", "facilit", "liais", "stakehold", "client", "custom"],
+    "projectDelivery": ["project", "deliv", "execut", "implement", "deploy", "launch", "rollout"],
+    "problemSolving": ["problem", "solv", "solution", "analys", "optim", "debug", "troubleshoot"],
+    "dataAnalysis": ["data", "analys", "analyt", "metric", "report", "dashboard", "insight", "kpi"],
+    "collaboration": ["teamwork", "collabor", "cross-function", "interdisciplinari", "partner"],
+    "creativity": ["innov", "design", "creativ", "prototyp", "ideat"],
+    "adaptability": ["flexibl", "adapt", "pivot", "agil", "scrum", "lean"],
+    "cloud": ["aws", "azure", "gcp", "google cloud", "terraform", "cloud"],
+    "security": ["secur", "cyber", "penetration", "owasp", "ceh", "encrypt"],
+    "devops": ["docker", "kubernetes", "ci", "cd", "jenkins", "gitops", "helm"],
+    "aiMl": ["ai", "ml", "machine learn", "deep learn", "neural", "nlp", "computer vision", "llm", "rag"]
+  },
+  "certificationMappings": [
+    { "pattern": "agentic|langchain|llm|rag|crewai|autogpt", "reason": "Agentic AI / LLM certification directly relevant to Generative AI role" },
+    { "pattern": "pytorch|tensorflow|keras|onnx|huggingface", "reason": "ML/Deep Learning framework certification directly relevant" },
+    { "pattern": "aws|azure|gcp|google cloud|terraform", "reason": "Cloud certification directly relevant to infrastructure requirements" },
+    { "pattern": "kubernetes|docker|ci\\s*/?\\s*cd|devops", "reason": "DevOps / containerisation certification directly relevant" },
+    { "pattern": "security|cyber|penetration|owasp|ceh", "reason": "Cybersecurity certification directly relevant" },
+    { "pattern": "agile|scrum|safe|pmp|project", "reason": "Project management / agile certification directly relevant" }
+  ],
+  "projectMappings": [
+    { "pattern": "ai|ml|machine\\s*learn|deep\\s*learn|neural|nlp|computer\\s*vision", "reason": "AI/ML project demonstrates strong algorithmic thinking" },
+    { "pattern": "web|frontend|backend|fullstack|api|microservice", "reason": "Full-stack engineering project demonstrating scalable architecture" },
+    { "pattern": "mobile|ios|android|react\\s*native|flutter", "reason": "Mobile development project demonstrating cross-platform delivery" },
+    { "pattern": "data|pipeline|etl|warehouse|spark|hadoop", "reason": "Data engineering project demonstrating large-scale data handling" },
+    { "pattern": "blockchain|crypto|web3|smart\\s*contract", "reason": "Blockchain project demonstrating decentralised system design" }
+  ]
+}

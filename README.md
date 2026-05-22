@@ -1,7 +1,7 @@
 # 🚀 CV Optimizer AI
 > AI-Powered CV Tailoring -- 100% Local, Free & Open Source
 
-**CV Optimizer AI** automatically tailors your CV for specific job adverts. Upload your CV (PDF or LinkedIn profile), paste a job description, and get a customized, professionally formatted PDF -- all running locally on your machine.
+**CV Optimizer AI** automatically tailors your CV for specific job adverts. -- all running locally on your machine.
 1.  **You upload** your CV (PDF file or website URL) + the job advert you're applying for
 2.  **The system reads** your experience, skills, education, and certifications
 3.  **The system analyzes** which parts of your background best match the job requirements
