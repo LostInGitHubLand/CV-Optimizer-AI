@@ -114,7 +114,7 @@ npm run start
 
 ## 🖥️ UI Preview
 
-![Home UI](app/docs/home.png)
+![Home UI](docs/home.png)
 
 ---
 
