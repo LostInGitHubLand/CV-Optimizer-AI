@@ -445,26 +445,118 @@ async function runWriterRefine(input: WriterRefineInput, log: Logger, onTokens?:
   let workingJsonCv = sanitizeJsonCv(synced);
   let workingMarkdown = currentMarkdown;
 
-  // Step 2: If instruction present, apply it on the synced result (combines both inputs)
+  // Step 2: If instructions are present, split them into atomic commands and apply sequentially.
+  // This makes refine robust when the user writes e.g.:
+  // "remove hobbies; add English C1; add GitHub ...; rewrite summary ..."
   if (instruction && instruction.trim()) {
-    log.info("WRITER_REFINE", `Applying instruction: "${instruction.substring(0, 60)}..."`);
-    try {
-      return await applyRefinementAI(workingJsonCv, workingMarkdown, instruction, title, domain, log, onTokens);
-    } catch (err) {
-      log.warn("WRITER_REFINE", "AI refinement failed, using text-edit fallback: " + (err instanceof Error ? err.message : String(err)));
-      const updatedMarkdown = applyMarkdownEdit(workingMarkdown, instruction, log);
-      // Resync JsonCv from the updated markdown so the Designer sees new sections
-      const updatedJsonCv = attemptMarkdownSync(workingJsonCv, updatedMarkdown, log, instruction);
-      return {
-        markdown: updatedMarkdown,
-        jsonCv: sanitizeJsonCv(updatedJsonCv),
-        title: updatedJsonCv.name || title,
-      };
+    const commands = parseRefinementCommands(instruction);
+    log.info("WRITER_REFINE", `Applying ${commands.length} refinement command(s)`);
+
+    for (let i = 0; i < commands.length; i++) {
+      const command = commands[i];
+      log.info("WRITER_REFINE", `Command ${i + 1}/${commands.length}: "${command.substring(0, 80)}..."`);
+      try {
+        const refined = await applyRefinementAI(workingJsonCv, workingMarkdown, command, title, domain, log, onTokens);
+        workingJsonCv = sanitizeJsonCv(refined.jsonCv);
+        workingMarkdown = stripUndefined(refined.markdown);
+      } catch (err) {
+        log.warn("WRITER_REFINE", "Command AI refinement failed, using text-edit fallback: " + (err instanceof Error ? err.message : String(err)));
+        workingMarkdown = applyMarkdownEdit(workingMarkdown, command, log);
+        workingJsonCv = sanitizeJsonCv(attemptMarkdownSync(workingJsonCv, workingMarkdown, log, command));
+      }
     }
+
+    // Final sync guarantees Markdown-driven edits are reflected in JsonCv after all commands.
+    const finalJsonCv = sanitizeJsonCv(attemptMarkdownSync(workingJsonCv, workingMarkdown, log, instruction));
+    return { markdown: workingMarkdown, jsonCv: finalJsonCv, title: finalJsonCv.name || title };
   }
 
   // No instruction — return synced result (Write Text only)
   return { markdown: workingMarkdown, jsonCv: workingJsonCv, title: workingJsonCv.name || title };
+}
+
+
+/**
+ * Split a free-form refine instruction into atomic commands.
+ * Supports bullets, numbered lists, semicolons, and common English/Italian connectors.
+ * URLs are protected so `https://...` is not broken while splitting.
+ */
+function parseRefinementCommands(instruction: string): string[] {
+  const placeholders: string[] = [];
+
+  const protect = (text: string) =>
+    text
+      .replace(/https?:\/\/\S+/gi, (match) => {
+        const token = `__PLACEHOLDER_${placeholders.length}__`;
+        placeholders.push(match);
+        return token;
+      })
+      .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, (match) => {
+        const token = `__PLACEHOLDER_${placeholders.length}__`;
+        placeholders.push(match);
+        return token;
+      });
+
+  const restore = (text: string) =>
+    text.replace(/__PLACEHOLDER_(\d+)__/g, (_, idx) => placeholders[Number(idx)] ?? "");
+
+  const actionWords = [
+    // English
+    "add", "include", "insert", "append",
+    "remove", "delete", "drop", "eliminate", "cut", "omit",
+    "rewrite", "change", "update", "replace", "make", "improve", "edit",
+
+    // Italian
+    "aggiungi", "inserisci", "includi",
+    "rimuovi", "elimina", "cancella", "togli", "ometti",
+    "riscrivi", "modifica", "aggiorna", "sostituisci", "rendi", "migliora"
+  ];
+
+  const actionPattern = actionWords.join("|");
+  const protectedText = protect(instruction);
+
+  const normalized = protectedText
+    .replace(/\r\n/g, "\n")
+
+    // Bullet / numbered lists
+    .replace(/\n\s*(?:[-*•]|\d+[.)])\s*/g, "\n")
+
+    // Semicolon separators
+    .replace(/;+/g, "\n")
+
+    // Textual connectors before a new action
+    .replace(
+      new RegExp(
+        `\\s+(?:and then|then|also|plus|in addition|besides|e poi|poi|inoltre|e anche|anche)\\s+(?=(?:${actionPattern})\\b)`,
+        "gi"
+      ),
+      "\n"
+    )
+
+    // "and/e" only when followed by a new action
+    .replace(
+      new RegExp(`\\s+(?:and|e)\\s+(?=(?:${actionPattern})\\b)`, "gi"),
+      "\n"
+    )
+
+    // Period separator ONLY when followed by a new action
+    .replace(
+      new RegExp(`\\.\\s+(?=(?:${actionPattern})\\b)`, "gi"),
+      ".\n"
+    );
+
+  const commands = normalized
+    .split(/\n+/)
+    .map((part) =>
+      restore(
+        part
+          .replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "")
+          .trim()
+      )
+    )
+    .filter((part) => part.length > 0);
+
+  return commands.length > 0 ? commands : [instruction.trim()];
 }
 
 /** When no instruction: parse Markdown and sync structured JsonCv to match. */
@@ -640,68 +732,40 @@ function attemptMarkdownSync(jsonCv: JsonCv, markdown: string, log: Logger, inst
 /** Map of common user synonyms/aliases to canonical section type names.
  *  Users often say "hobby" instead of "interests", "cert" instead of
  *  "certifications", etc. This mapping bridges the gap.                */
-const SECTION_ALIASES: Record<string, string> = {
-  // interests
-  "hobby": "interests", "hobbies": "interests",
-  // experience
-  "job": "experience", "jobs": "experience", "work": "experience",
-  "work history": "experience", "employment": "experience", "employment history": "experience",
-  "career": "experience", "career history": "experience",
-  "position": "experience", "positions": "experience",
-  "role": "experience", "roles": "experience",
-  "professional experience": "experience", "work experience": "experience",
-  // education
-  "degree": "education", "degrees": "education", "school": "education",
-  "university": "education", "college": "education",
-  "academic": "education", "academics": "education",
-  "training": "education", "course": "education", "courses": "education",
-  "diploma": "education", "diplomas": "education",
-  // certifications
-  "cert": "certifications", "certs": "certifications", "certification": "certifications",
-  "certificate": "certifications", "certificates": "certifications",
-  "qualification": "certifications", "qualifications": "certifications",
-  "license": "certifications", "licenses": "certifications",
-  "credential": "certifications", "credentials": "certifications",
-  "accreditation": "certifications", "accreditations": "certifications",
-  // publications
-  "publication": "publications", "paper": "publications", "papers": "publications",
-  "article": "publications", "articles": "publications",
-  "research": "publications", "thesis": "publications", "dissertation": "publications",
-  // volunteer
-  "volunteering": "volunteer", "volunteer work": "volunteer",
-  "community service": "volunteer", "charity work": "volunteer",
-  "voluntary work": "volunteer",
-  // languages
-  "language": "languages", "fluent": "languages",
-  "bilingual": "languages", "multilingual": "languages",
-  "native speaker": "languages", "foreign language": "languages",
-  // summary
-  "personal summary": "summary", "profile": "summary", "about me": "summary",
-  "objective": "summary", "career objective": "summary",
-  "about": "summary", "overview": "summary", "bio": "summary",
-  "introduction": "summary", "intro": "summary",
-  "professional summary": "summary", "executive summary": "summary",
-  // contact
-  "contact info": "contact", "contact details": "contact",
-  "phone": "contact", "email": "contact", "address": "contact",
-  "location": "contact", "linkedin": "contact", "website": "contact",
-  // awards
-  "award": "awards", "awards": "awards", "prize": "awards", "prizes": "awards",
-  "honor": "awards", "honors": "awards",
-  "achievement": "awards", "achievements": "awards",
-  "accomplishment": "awards", "accomplishments": "awards",
-  "recognition": "awards", "commendation": "awards", "commendations": "awards",
-  // projects
-  "project": "projects", "portfolio": "projects", "side project": "projects",
-  // skills
-  "skill": "skills", "skills": "skills",
-  "competency": "skills", "competencies": "skills",
-  "expertise": "skills", "proficiency": "skills", "proficiencies": "skills",
-  "ability": "skills", "abilities": "skills",
-  "strength": "skills", "strengths": "skills",
-  "capability": "skills", "capabilities": "skills",
-  "technical skill": "skills", "soft skill": "skills",
+const buildAliasMap = () => {
+  const entries: Array<[string, string]> = [
+    // interests
+    ["hobby", "interests"],
+    ["hobbies", "interests"],
+
+    // experience
+    ["job", "experience"],
+    ["jobs", "experience"],
+    ["work", "experience"],
+
+    // contact
+    ["contact info", "contact"],
+    ["contact details", "contact"],
+    ["phone", "contact"],
+    ["email", "contact"],
+    ["address", "contact"],
+    ["location", "contact"],
+    ["linkedin", "contact"],
+    ["website", "contact"],
+
+    // skills
+    ["skill", "skills"],
+    ["skills", "skills"],
+    ["competency", "skills"],
+    ["competencies", "skills"],
+  ];
+
+  return Object.fromEntries(
+    Array.from(new Map(entries)) // 🔥 deduplica automaticamente
+  );
 };
+
+const SECTION_ALIASES = buildAliasMap();
 
 function parseRemovalInstruction(instruction: string): string[] {
   const lower = instruction.toLowerCase();
@@ -712,9 +776,9 @@ function parseRemovalInstruction(instruction: string): string[] {
   
   // Phase 1: Check for aliases (e.g., "hobby" → "interests")
   // Look for "remove hobby" patterns where the noun is an alias
-  const actionPattern = `(?:remove|delete|drop|eliminate|get rid of|cut|omit)`;
+  const actionPattern = `(?:remove|delete|drop|eliminate|get rid of|cut|omit|rimuovi|elimina|cancella|togli|ometti)`;
   for (const [alias, canonical] of Object.entries(SECTION_ALIASES)) {
-    const regex = new RegExp(`\\b${actionPattern}\\s+(?:the\\s+)?${alias}\\b`, "i");
+    const regex = new RegExp(`\\b${actionPattern}\\s+(?:the\\s+|la\\s+|il\\s+|i\\s+|gli\\s+|le\\s+)?(?:section\\s+|sezione\\s+)?${alias}\\b`, "i");
     if (regex.test(lower) && !removals.includes(canonical)) {
       removals.push(canonical);
     }
@@ -723,7 +787,7 @@ function parseRemovalInstruction(instruction: string): string[] {
   // Phase 2: Check for exact section type names
   // Pattern: "remove/delete/drop/eliminate/get rid of [the] X [section]"
   for (const type of sectionTypes) {
-    const regex = new RegExp(`\\b${actionPattern}\\s+(?:the\\s+)?${type}(?:\\s+section)?\\b`, "i");
+    const regex = new RegExp(`\\b${actionPattern}\\s+(?:the\\s+|la\\s+|il\\s+|i\\s+|gli\\s+|le\\s+)?(?:section\\s+|sezione\\s+)?${type}(?:\\s+section|\\s+sezione)?\\b`, "i");
     if (regex.test(lower) && !removals.includes(type)) {
       removals.push(type);
     }
@@ -735,7 +799,7 @@ function parseRemovalInstruction(instruction: string): string[] {
     "publications": "publications", "interests": "interests", "languages": "languages",
   };
   for (const [plural, singular] of Object.entries(pluralMap)) {
-    const regex = new RegExp(`\\b${actionPattern}\\s+(?:the\\s+)?${plural}\\b`, "i");
+    const regex = new RegExp(`\\b${actionPattern}\\s+(?:the\\s+|la\\s+|il\\s+|i\\s+|gli\\s+|le\\s+)?(?:section\\s+|sezione\\s+)?${plural}\\b`, "i");
     if (regex.test(lower) && !removals.includes(singular)) {
       removals.push(singular);
     }
@@ -800,7 +864,7 @@ async function applyRefinementAI(currentJsonCv: JsonCv, currentMarkdown: string,
     for (const s of sectionsToRemove) explicitlyRemoved.add(s);
 
     // If removal was the ONLY thing requested, return early (no need for AI)
-    const cleanInstruction = instruction.toLowerCase().replace(/(?:remove|delete|drop|eliminate|get rid of|cut|omit)\s+(?:the\s+)?\w+(?:\s+section)?/gi, "").trim();
+    const cleanInstruction = instruction.toLowerCase().replace(/(?:remove|delete|drop|eliminate|get rid of|cut|omit|rimuovi|elimina|cancella|togli|ometti)\s+(?:the\s+|la\s+|il\s+|i\s+|gli\s+|le\s+)?[\wÀ-ÿ]+(?:\s+section|\s+sezione)?/gi, "").trim();
     if (!cleanInstruction || cleanInstruction.length < 10) {
       log.info("WRITER_REFINE", "Removal-only instruction, skipping AI call");
       return { markdown, jsonCv: sanitizeJsonCv(jsonCv), title: jsonCv.name || title };
@@ -842,10 +906,10 @@ If you are unsure about a change, prefer the conservative option (minimal edit).
 ${instruction}
 
 ## CURRENT JSONCV
-${JSON.stringify(currentJsonCv, null, 2).substring(0, 6000)}
+${JSON.stringify(jsonCv, null, 2).substring(0, 6000)}
 
 ## CURRENT MARKDOWN
-${currentMarkdown.substring(0, 4000)}
+${markdown.substring(0, 4000)}
 
 ## YOUR TASK
 
@@ -915,8 +979,8 @@ function applyMarkdownEdit(markdown: string, instruction: string, log: Logger): 
   // Patterns: "add languages: Italian native, English B2"
   //           "add language English B2"
   //           "add Italian native and English fluent"
-  const langDirectiveMatch = instruction.match(/add\s+(?:language[s]?\s*[:\s]\s*)(.+)/i);
-  const langSimpleMatch = instruction.match(/add\s+language\s+(.+)/i);
+  const langDirectiveMatch = instruction.match(/(?:add|aggiungi|inserisci)\s+(?:language[s]?|lingu[ae])\s*[:\s]\s*(.+)/i);
+  const langSimpleMatch = instruction.match(/(?:add|aggiungi|inserisci)\s+(?:language|lingua)\s+(.+)/i);
   const langListMatch = langDirectiveMatch || langSimpleMatch;
 
   if (langListMatch || /\badd\b.*\b(italian|english|french|spanish|german|portuguese|chinese|japanese|russian|arabic|hindi|korean|dutch|polish|turkish|swedish|norwegian|danish|finnish|czech|hungarian|romanian|greek|hebrew|thai|vietnamese)\b/i.test(lower)) {
@@ -943,8 +1007,8 @@ function applyMarkdownEdit(markdown: string, instruction: string, log: Logger): 
   }
 
   // ── Contact additions ──────────────────────────────────────────────────
-  if (/add\s+(github|git|portfolio|website|twitter|x|linkedin|email|phone)/i.test(lower)) {
-    const contactType = instruction.match(/(?:add|include)\s+(?:my\s+)?([^\s]+)/i)?.[1] || "";
+  if (/(?:add|include|aggiungi|inserisci|includi)\s+(github|git|portfolio|website|sito|twitter|x|linkedin|email|phone|telefono)/i.test(lower)) {
+    const contactType = instruction.match(/(?:add|include|aggiungi|inserisci|includi)\s+(?:my\s+|il\s+mio\s+|la\s+mia\s+)?([^\s]+)/i)?.[1] || "";
     const contactValue =
     instruction.match(/https?:\/\/[^\s]+/i)?.[0] ||
     instruction.match(/\b(?:github|linkedin)\.com\/[^\s]+/i)?.[0] ||
@@ -965,7 +1029,7 @@ function applyMarkdownEdit(markdown: string, instruction: string, log: Logger): 
   }
 
   // ── Summary edits ──────────────────────────────────────────────────────
-  if (/summary|headline|objective/i.test(lower)) {
+  if (/summary|headline|objective|riepilogo|sommario|profilo|presentazione/i.test(lower)) {
     const newSummary = instruction.replace(/.*(?:to\s+|make\s+|write\s+|use\s+)/i, "").trim();
     if (newSummary.length > 10 && markdown.includes("**Summary**")) {
       return markdown.replace(/(\*\*Summary:?\*\*)\s*\n\n?([\s\S]*?)(?=\n\*\*|\n##\s|$)/i, `**Summary**\n\n${newSummary}\n\n`);

@@ -31,6 +31,12 @@ dist-ssr
 *.sqlite
 *.sqlite3
 db/migrations/*.sql
+# SQLite
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
 # TypeScript cache
 *.tsbuildinfo
 # Build outputs
@@ -39,3 +45,6 @@ build/
 # Test coverage
 coverage/
 .nyc_output/
+
+/api/uploads/
+/api/output/

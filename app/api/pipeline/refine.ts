@@ -73,6 +73,7 @@ export async function runRefinementWithResilience(
         currentJsonCv: jsonCv as Record<string, unknown>,
         currentMarkdown: markdown,
         instruction: writerInstruction,
+        title: (jsonCv as Record<string, string>).name ?? (jsonCv as Record<string, string>).title ?? "",
       }, log, (p, g) => recordTokens(jobId, "WRITER", "refine", p, g));
       refined = result;
       log.info("WRITER_REFINE", "Sync/AI complete", timer);
