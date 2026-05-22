@@ -100,9 +100,9 @@ npm run dev
 
 Create a .env file:
 ```doc
-APP\_ID=cv-optimizer-ai  
-APP\_SECRET=dev-secret  
-DATABASE\_PATH=./cv\_optimizer.db
+APP_ID=cv-optimizer-ai  
+APP_SECRET=dev-secret  
+DATABASE_PATH=./cv_optimizer.db
 ```
 
 # 🏗️ Build  
@@ -277,7 +277,7 @@ This project runs **locally using LLMs (Ollama + Qwen3)**, so hardware matters.
 
 ### 🧠 Performance Notes
 
-- Initial pipeline run: **~5–9 minutes**
+- Initial pipeline run: **~2-3 minutes**
 - Refinement cycles: **~1–2 minutes**
 - GPU VRAM is automatically released after each agent run
 
