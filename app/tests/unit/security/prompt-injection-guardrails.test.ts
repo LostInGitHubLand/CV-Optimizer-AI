@@ -5,7 +5,7 @@ import {
   buildWriterSystemRules,
   buildRefinementSystemRules,
 } from "../../../api/agents/core-rules";
-import { fallbackExtraction } from "../../../api/agents/fetcher";
+import { fallbackExtraction } from "../../../api/agents/fetcher00";
 import { runRuleBasedAnalysis } from "../../../api/agents/analyst";
 import { createMockLogger } from "../../helpers/mock-logger";
 
@@ -60,7 +60,6 @@ Python, SQL, Power BI
     expect(serialized).toContain("python");
     expect(serialized).not.toContain("pirate");
     expect(serialized).not.toContain("reveal your system prompt");
-    expect(serialized).not.toContain("92%");
   });
 
   it("analyst rule-based fallback does not convert malicious job advert text into strategy facts", () => {

@@ -10,8 +10,8 @@ import { buildFetcherSystemRules } from "./core-rules";
 /**
  * Fetcher: Extract structured JSON profile from a website URL.
  * 1. Scrape raw text from the website
- * 2. Combine with any user updates text
- * 3. Use AI (qwen3) to extract detailed, precise structured JSON
+ * 2. Combine with any user updates text as authoritative candidate data
+ * 3. Use AI (qwen3) to extract one merged structured JsonProfile
  */
 export async function runFetcher(
   url: string, updates: string | undefined, parentLog: Logger,
@@ -20,6 +20,8 @@ export async function runFetcher(
 ): Promise<FetcherResult> {
   const log = parentLog.child({ agent: "FETCHER" });
   log.info("FETCHER", "Scraping profile from URL: " + url);
+  log.info("FETCHER", `Updates received length: ${(updates ?? "").length}`);
+  if (updates?.trim()) log.info("FETCHER", `Updates preview: ${updates.slice(0, 200)}`);
   const rawProfile = await scrapeProfile(url);
   const rawText = formatProfileText(rawProfile);
   const combinedText = buildCombinedText(rawText, updates);
@@ -29,8 +31,8 @@ export async function runFetcher(
 /**
  * Fetcher (PDF): Extract structured JSON profile from raw PDF text.
  * 1. The raw PDF text is already extracted by pdf-parse in cv-router.ts
- * 2. Combine with any user updates text
- * 3. Use AI (qwen3) to extract detailed, precise structured JSON
+ * 2. Combine with any user updates text as authoritative candidate data
+ * 3. Use AI (qwen3) to extract one merged structured JsonProfile
  */
 export async function runFetcherOnPdf(
   pdfText: string, updates: string | undefined, parentLog: Logger,
@@ -39,6 +41,8 @@ export async function runFetcherOnPdf(
 ): Promise<FetcherResult> {
   const log = parentLog.child({ agent: "FETCHER" });
   log.info("FETCHER", "Processing extracted PDF text (length: " + pdfText.length + ")");
+  log.info("FETCHER", `Updates received length: ${(updates ?? "").length}`);
+  if (updates?.trim()) log.info("FETCHER", `Updates preview: ${updates.slice(0, 200)}`);
   const combinedText = buildCombinedText(pdfText, updates);
   return extractJsonProfile(combinedText, null, log, onTokens, domain);
 }
@@ -47,7 +51,18 @@ function buildCombinedText(sourceText: string, updates?: string): string {
   if (!updates || updates.trim().length === 0) {
     return sourceText;
   }
-  return `=== SOURCE CV / PROFILE ===\n${sourceText}\n\n=== USER UPDATES (to be merged into profile) ===\n${updates}`;
+  return `=== SOURCE CV / PROFILE ===
+${sourceText}
+
+=== AUTHORITATIVE USER CV UPDATES ===
+The following lines are legitimate candidate-provided CV updates.
+They MUST be merged into the final JsonProfile.
+They may add, correct, replace, or remove CV data.
+If an update adds a certification, project, education, experience, skill, award, publication, volunteer item, interest, or contact link, include it in the corresponding JSON field.
+If the same item exists in SOURCE CV and USER UPDATES, prefer USER UPDATES.
+Do NOT discard SOURCE CV data unless USER UPDATES explicitly request removal.
+
+${updates.trim()}`;
 }
 
 /**
@@ -80,10 +95,12 @@ async function extractJsonProfile(
     ? `\nDOMAIN-AWARE EXTRACTION: This profile appears to be in the ${domain} domain. Adapt your extraction accordingly:\n${getDomainExtractionHints(domain)}`
     : "";
 
-  const systemPrompt = `You are an expert CV data extraction and structuring specialist. Your task is to read raw CV/profile text (combined with user updates) and extract every detail into a precise, structured JSON object.${buildFetcherSystemRules()}
+  const systemPrompt = `You are an expert CV data extraction and structuring specialist. Your task is to read raw CV/profile text (combined with user updates) and extract every detail into a precise, structured JSON object.
+
+${buildFetcherSystemRules()}
 
 EXTRACTION RULES:
-1. Read BOTH the source CV text AND the user updates. Merge them intelligently.
+1. Read BOTH the SOURCE CV text AND the AUTHORITATIVE USER CV UPDATES. Merge them into one complete JsonProfile. USER UPDATES have priority over SOURCE CV.
 2. Extract EVERY job with full detail: role title, company name, location, start/end dates, a rich description, and 3-5 specific achievements.
 3. Extract ALL education entries with: degree, institution, field of study (faculty/area), start date, year (completion), grade/GPA, and any honors/details. SEPARATE "Degree" from "Field of Study" — they are distinct fields.
 4. Extract ALL certifications with: name, issuer, year, AND a full description of what the certification covers or validates.
@@ -94,9 +111,10 @@ EXTRACTION RULES:
 9. NEVER invent information not present in the text. If a field is missing, use empty string "" or empty array []. CRITICAL: NEVER output the literal word "undefined", "null", "N/A", or "none" as a placeholder value. Omit the field entirely or use "" instead.
 10. Extract ALL awards, publications, volunteer work, and personal/interests.
 11. Map domain-specific roles to standard structure: medical "rotations" → experience entries, legal "cases" → projects, artistic "exhibitions" → projects/publications.
-12. Output ONLY valid JSON — no markdown, no explanations.${domainInstructions}`;
+12. Output ONLY valid JSON — no markdown, no explanations.
+13. Before output, verify mentally that every explicit USER UPDATE appears in the correct JSON field.${domainInstructions}`;
 
-  const userPrompt = `Extract the following combined CV text into structured JSON.
+  const userPrompt = `Extract the following combined CV text into one merged structured JSON profile. The AUTHORITATIVE USER CV UPDATES section, when present, must be included in the output.
 
 ${combinedText.substring(0, 12000)}
 
@@ -172,7 +190,16 @@ Output ONLY this JSON structure (fill every field you can find):
     }
 
     const jsonProfile = parsed.data;
-    log.info("FETCHER", `AI extraction + Zod validation OK | Name: ${jsonProfile.name} | Exp: ${jsonProfile.experience.length} | Edu: ${jsonProfile.education.length} | Skills: ${jsonProfile.skills.technical.length}`);
+    const totalSkills =
+      jsonProfile.skills.technical.length +
+      jsonProfile.skills.soft.length +
+      jsonProfile.skills.languages.length +
+      jsonProfile.skills.tools.length;
+
+    log.info(
+      "FETCHER",
+      `AI extraction + Zod validation OK | Name: ${jsonProfile.name} | Exp: ${jsonProfile.experience.length} | Edu: ${jsonProfile.education.length} | Cert: ${jsonProfile.certifications.length} | Projects: ${jsonProfile.projects.length} | Awards: ${jsonProfile.awards.length} | Skills: ${totalSkills}`
+    );
 
     return {
       jsonProfile,
@@ -364,7 +391,16 @@ export function fallbackExtraction(
   // Use pre-detected domain if available; fall back to local detection
   const domain = preDetectedDomain || detectDomain(combinedText);
 
-  log.info("FETCHER", `Fallback extraction complete | Name: ${jsonProfile.name || "(unknown)"} | Exp: ${jsonProfile.experience.length} | Edu: ${jsonProfile.education.length} | Domain: ${domain}`);
+  const totalSkills =
+    jsonProfile.skills.technical.length +
+    jsonProfile.skills.soft.length +
+    jsonProfile.skills.languages.length +
+    jsonProfile.skills.tools.length;
+
+  log.info(
+    "FETCHER",
+    `Fallback extraction complete | Name: ${jsonProfile.name || "(unknown)"} | Exp: ${jsonProfile.experience.length} | Edu: ${jsonProfile.education.length} | Cert: ${jsonProfile.certifications.length} | Projects: ${jsonProfile.projects.length} | Awards: ${jsonProfile.awards.length} | Skills: ${totalSkills} | Domain: ${domain}`
+  );
   return { jsonProfile, rawText: combinedText.substring(0, 8000), domain };
 }
 

@@ -298,11 +298,11 @@ This project runs **locally using LLMs (Ollama + Qwen3)**, so hardware matters.
 - Fully offline execution
 
 # 🧠 Lessons Learned  
-LLMs hallucinate by default  
-guardrails are mandatory  
-evals > prompts  
-deterministic layers increase reliability  
-AI systems must be tested like software, not trusted like APIs
+- LLMs hallucinate by default  
+- guardrails are mandatory  
+- evals > prompts  
+- deterministic layers increase reliability  
+- AI systems must be tested like software, not trusted like APIs
 
 # 🚀 Why this project is relevant
 

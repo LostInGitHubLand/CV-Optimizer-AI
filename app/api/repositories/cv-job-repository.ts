@@ -22,6 +22,7 @@ export async function createJobRepo(dto: CreateJobDto, sessionId: string): Promi
       inputType: dto.inputType,
       sourceUrl: dto.sourceUrl ?? null,
       jobAdvert: dto.jobAdvert ?? null,
+      updates: dto.updates ?? null,
       sessionId,
       status: JobStatus.Pending,
       currentState: "main",

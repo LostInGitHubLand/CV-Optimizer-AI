@@ -67,7 +67,10 @@ async function runPipelineCore(
   const job = await findJobById(jobId);
   if (!job) throw new Error(`Job ${jobId} not found at pipeline start`);
   const jobAdvert = job.jobAdvert || "";
-
+  log.info(
+    "PIPELINE",
+    `Job updates loaded | length: ${(job.updates ?? "").length} | preview: ${(job.updates ?? "").slice(0, 120)}`
+  );
   /* ── STAGE 1: FETCHER ── */
   log.info("FETCHER", "Starting extraction...");
   await agentStarted(jobId, JobStatus.Fetching, "FETCHER", "Extracting structured data...", log);
@@ -90,8 +93,13 @@ async function runPipelineCore(
         rawText = await extractTextFromPdf(job.pdfPath);
         await saveRawText(jobId, rawText);
       }
-      const textWithUpdates = `${rawText}\n\n${job.updates ?? ""}`.trim();
-      const result = await runFetcherOnPdf(textWithUpdates, job.updates ?? undefined, log, (p, g) => recordTokens(jobId, "FETCHER", "main", p, g), domain);
+      const result = await runFetcherOnPdf(
+        rawText,
+        job.updates ?? undefined,
+        log,
+        (p, g) => recordTokens(jobId, "FETCHER", "main", p, g),
+        domain
+      );
       profile = result.jsonProfile as Record<string, unknown>;
       fetcherOutput = JSON.stringify(result.jsonProfile);
       log.info("FETCHER", "PDF extraction complete", timer);

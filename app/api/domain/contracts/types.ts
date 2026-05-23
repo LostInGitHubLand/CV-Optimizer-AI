@@ -24,6 +24,7 @@ export interface CreateJobDto {
   pdfPath?: string;
   rawText?: string;
   jobAdvert?: string;
+  updates?: string;
   sessionId?: string;
 }
 
