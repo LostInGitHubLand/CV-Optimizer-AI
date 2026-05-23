@@ -46,5 +46,5 @@ build/
 coverage/
 .nyc_output/
 
-/api/uploads/
-/api/output/
+app/api/uploads/
+app/api/output/

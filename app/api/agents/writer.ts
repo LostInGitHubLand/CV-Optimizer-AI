@@ -378,6 +378,26 @@ ACTION VERBS: Replace generic verbs with precise action verbs.
   }
   if (!result.markdown || !result.jsonCv) throw new Error("[WRITER] AI response missing markdown or jsonCv");
 
+  // Restore top-level identity fields if AI dropped them
+if (!result.jsonCv.name && baseJsonCv.name) {
+  log.warn("WRITER", "AI dropped name — restoring from base JsonCv");
+  result.jsonCv.name = baseJsonCv.name;
+}
+
+if (!result.jsonCv.title && baseJsonCv.title) {
+  log.warn("WRITER", "AI dropped title — restoring from base JsonCv");
+  result.jsonCv.title = baseJsonCv.title;
+}
+
+if (!result.jsonCv.contact || Object.keys(result.jsonCv.contact).length === 0) {
+  log.warn("WRITER", "AI dropped contact — restoring from base JsonCv");
+  result.jsonCv.contact = JSON.parse(JSON.stringify(baseJsonCv.contact));
+}
+
+if (!result.jsonCv.summary && baseJsonCv.summary) {
+  log.warn("WRITER", "AI dropped summary — restoring from base JsonCv");
+  result.jsonCv.summary = baseJsonCv.summary;
+}
   // ── Restore skills if AI dropped or reduced them ──
   const baseSkillItems = countSkillItems(baseJsonCv);
   const resultSkillItems = countSkillItems(result.jsonCv);
