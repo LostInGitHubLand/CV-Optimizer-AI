@@ -81,6 +81,7 @@ export interface WriterRefineInput {
   instruction: string;
   title: string;
   domain?: Domain;
+  markdownEdited?: boolean;
 }
 
 export type WriterInput = WriterMainInput | WriterRefineInput;
@@ -458,16 +459,47 @@ if (!result.jsonCv.summary && baseJsonCv.summary) {
 
 async function runWriterRefine(input: WriterRefineInput, log: Logger, onTokens?: TokenReporter): Promise<WriterResult> {
   const { currentJsonCv, currentMarkdown, instruction, title, domain } = input;
+  const markdownEdited = !!input.markdownEdited;
 
-  // Step 1: Always sync JsonCv from currentMarkdown first (captures Write Text edits)
-  log.info("WRITER_REFINE", "Syncing JsonCv from current markdown");
-  const synced = attemptMarkdownSync(currentJsonCv, currentMarkdown, log);
-  let workingJsonCv = sanitizeJsonCv(synced);
-  let workingMarkdown = currentMarkdown;
+  log.info(
+    "WRITER_REFINE",
+    `Starting refine | markdownEdited=${markdownEdited} | markdownLength=${currentMarkdown.length} | instructionLength=${instruction?.trim().length ?? 0}`
+  );
 
-  // Step 2: If instructions are present, split them into atomic commands and apply sequentially.
-  // This makes refine robust when the user writes e.g.:
-  // "remove hobbies; add English C1; add GitHub ...; rewrite summary ..."
+  let workingJsonCv: JsonCv;
+  let workingMarkdown = stripUndefined(currentMarkdown);
+
+  // When the user edits the Write Text markdown manually, do NOT use the deterministic
+  // markdown parser as the primary source of truth. Ask the AI to rebuild the structured
+  // JsonCv from the edited markdown, preserving the JsonCv schema and field semantics.
+  if (markdownEdited) {
+    try {
+      log.info("WRITER_REFINE", "Rebuilding JsonCv from manually edited markdown via AI");
+      const rebuilt = await rebuildJsonCvFromEditedMarkdownAI(
+        currentJsonCv,
+        workingMarkdown,
+        title,
+        domain,
+        log,
+        onTokens
+      );
+      workingJsonCv = sanitizeJsonCv(cleanJsonCvMarkdownArtifacts(rebuilt.jsonCv, log));
+      workingMarkdown = stripUndefined(rebuilt.markdown || workingMarkdown);
+      log.info(
+        "WRITER_REFINE",
+        `AI markdown rebuild complete | markdownLength=${workingMarkdown.length} | sections=${workingJsonCv.sections.map((s) => `${s.type}:${s.entries.length}`).join(", ")} | skills=${workingJsonCv.skills?.categories?.map((c) => `${c.name}:${c.items.length}`).join(", ") || "none"}`
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn("WRITER_REFINE", `AI markdown rebuild failed: ${msg}. Falling back to light markdown sync.`);
+      workingJsonCv = sanitizeJsonCv(attemptMarkdownSync(currentJsonCv, workingMarkdown, log, undefined, { strongSync: false }));
+    }
+  } else {
+    log.info("WRITER_REFINE", "No manual markdown edit detected — using light markdown sync");
+    workingJsonCv = sanitizeJsonCv(attemptMarkdownSync(currentJsonCv, workingMarkdown, log, undefined, { strongSync: false }));
+  }
+
+  // If writer instructions are present, apply them after the markdown rebuild.
   if (instruction && instruction.trim()) {
     const commands = parseRefinementCommands(instruction);
     log.info("WRITER_REFINE", `Applying ${commands.length} refinement command(s)`);
@@ -477,22 +509,222 @@ async function runWriterRefine(input: WriterRefineInput, log: Logger, onTokens?:
       log.info("WRITER_REFINE", `Command ${i + 1}/${commands.length}: "${command.substring(0, 80)}..."`);
       try {
         const refined = await applyRefinementAI(workingJsonCv, workingMarkdown, command, title, domain, log, onTokens);
-        workingJsonCv = sanitizeJsonCv(refined.jsonCv);
+        workingJsonCv = sanitizeJsonCv(cleanJsonCvMarkdownArtifacts(refined.jsonCv, log));
         workingMarkdown = stripUndefined(refined.markdown);
+        log.info(
+          "WRITER_REFINE",
+          `Command applied | markdownLength=${workingMarkdown.length} | sections=${workingJsonCv.sections.map((s) => `${s.type}:${s.entries.length}`).join(", ")}`
+        );
       } catch (err) {
         log.warn("WRITER_REFINE", "Command AI refinement failed, using text-edit fallback: " + (err instanceof Error ? err.message : String(err)));
         workingMarkdown = applyMarkdownEdit(workingMarkdown, command, log);
-        workingJsonCv = sanitizeJsonCv(attemptMarkdownSync(workingJsonCv, workingMarkdown, log, command));
+        workingJsonCv = sanitizeJsonCv(attemptMarkdownSync(workingJsonCv, workingMarkdown, log, command, { strongSync: false }));
       }
     }
-
-    // Final sync guarantees Markdown-driven edits are reflected in JsonCv after all commands.
-    const finalJsonCv = sanitizeJsonCv(attemptMarkdownSync(workingJsonCv, workingMarkdown, log, instruction));
-    return { markdown: workingMarkdown, jsonCv: finalJsonCv, title: finalJsonCv.name || title };
   }
 
-  // No instruction — return synced result (Write Text only)
-  return { markdown: workingMarkdown, jsonCv: workingJsonCv, title: workingJsonCv.name || title };
+  const finalJsonCv = sanitizeJsonCv(cleanJsonCvMarkdownArtifacts(workingJsonCv, log));
+  log.info(
+    "WRITER_REFINE",
+    `Refine final output | markdownLength=${workingMarkdown.length} | sections=${finalJsonCv.sections.map((s) => `${s.type}:${s.entries.length}`).join(", ")} | contactKeys=${Object.keys(finalJsonCv.contact ?? {}).join(", ")} | skills=${finalJsonCv.skills?.categories?.map((c) => `${c.name}:${c.items.length}`).join(", ") || "none"}`
+  );
+
+  return { markdown: workingMarkdown, jsonCv: finalJsonCv, title: finalJsonCv.name || title };
+}
+
+async function rebuildJsonCvFromEditedMarkdownAI(
+  baseJsonCv: JsonCv,
+  editedMarkdown: string,
+  title: string,
+  domain: Domain | undefined,
+  log: Logger,
+  onTokens?: TokenReporter
+): Promise<WriterResult> {
+  const domainInstruction = domain && domain !== "unknown"
+    ? `\n[DOMAIN CONTEXT: ${domain}] Preserve domain-appropriate wording, but do not invent facts.`
+    : "";
+
+  const systemPrompt = `You are a CV structure reconciler. Your task is to convert the user's edited Markdown CV into a clean JsonCv object.
+
+CRITICAL GOAL:
+- The edited Markdown is the user's source of truth for content changes.
+- Rebuild JsonCv so the PDF renderer can reproduce the edited CV correctly.
+- Do NOT output markdown syntax inside JsonCv fields. No "#", "##", "###", "**", "JsonCv", "Markdown", code fences, or section labels as entry titles.
+
+SCHEMA RULES:
+- Preserve the same JsonCv schema as the input.
+- name/title/contact/summary must remain top-level fields.
+- skills must be stored ONLY in jsonCv.skills.categories, not as a normal section.
+- experience entries must preserve: heading = job title, subheading = company, date = dates/location line when present, description, bullets.
+- education entries must preserve: heading = degree/title, subheading = institution/field, date = year/range, bullets/details.
+- certifications/projects/awards/publications/volunteer/interests/languages must preserve structured fields: heading, subheading, date, description, bullets.
+- If a section is absent from the edited Markdown, keep the section object if it existed, but set its entries to []. For skills use categories: []. For contact use {}. For summary use "".
+- If a section exists in Markdown, do not leave titles/headings empty.
+
+CONTENT RULES:
+- Do not invent facts, metrics, dates, companies, schools, certifications, projects, or skills.
+- Keep the user's edited content exactly where possible.
+- Remove any parser artifacts, labels, or wrappers such as "### JsonCv", "### Markdown", "JsonCv", "Markdown".
+- Return updated markdown too, cleaned of any accidental JsonCv/Markdown labels or code fences.${domainInstruction}`;
+
+  const userPrompt = `## BASE JSONCV BEFORE MANUAL EDIT
+${JSON.stringify(baseJsonCv, null, 2).substring(0, 9000)}
+
+## USER-EDITED MARKDOWN CV
+${editedMarkdown.substring(0, 9000)}
+
+## TASK
+Return ONLY valid JSON with this exact shape:
+{
+  "markdown": "clean markdown CV text",
+  "jsonCv": { "name": "...", "title": "...", "contact": {}, "summary": "...", "sections": [], "skills": { "categories": [] }, "metadata": {} }
+}`;
+
+  const response = await queryOllama({
+    prompt: userPrompt,
+    system: systemPrompt,
+    model: "qwen3",
+    temperature: 0.1,
+    unloadAfter: true,
+    log,
+    onTokens,
+  });
+
+  const rawText = typeof response === "string" ? response : JSON.stringify(response);
+  const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new Error("[WRITER_REFINE] No JSON found in AI markdown rebuild response");
+
+  let result: { markdown: string; jsonCv: JsonCv };
+  try {
+    result = JSON.parse(jsonMatch[0]);
+  } catch {
+    const cleaned = jsonMatch[0].replace(/[\x00-\x1f]/g, "");
+    result = JSON.parse(cleaned);
+  }
+
+  if (!result.markdown || !result.jsonCv) {
+    throw new Error("[WRITER_REFINE] AI markdown rebuild response missing markdown or jsonCv");
+  }
+
+  result.jsonCv = mergeMissingStableTopLevelFields(baseJsonCv, result.jsonCv, log);
+  result.jsonCv = cleanJsonCvMarkdownArtifacts(result.jsonCv, log);
+  result.markdown = cleanMarkdownArtifacts(result.markdown);
+
+  validateWriterOutput({ markdown: result.markdown, jsonCv: result.jsonCv });
+  return { markdown: result.markdown, jsonCv: result.jsonCv, title: result.jsonCv.name || title };
+}
+
+function mergeMissingStableTopLevelFields(baseJsonCv: JsonCv, nextJsonCv: JsonCv, log: Logger): JsonCv {
+  const merged = JSON.parse(JSON.stringify(nextJsonCv)) as JsonCv;
+
+  if (!merged.name && baseJsonCv.name) {
+    merged.name = baseJsonCv.name;
+    log.warn("WRITER_REFINE", "AI markdown rebuild dropped name — restored from base JsonCv");
+  }
+  if (!merged.title && baseJsonCv.title) {
+    merged.title = baseJsonCv.title;
+    log.warn("WRITER_REFINE", "AI markdown rebuild dropped title — restored from base JsonCv");
+  }
+  if (!merged.metadata && baseJsonCv.metadata) {
+    merged.metadata = JSON.parse(JSON.stringify(baseJsonCv.metadata));
+  }
+  if (!merged.metadata?.layoutDirectives && baseJsonCv.metadata?.layoutDirectives) {
+    merged.metadata = {
+      ...(merged.metadata ?? { targetRole: "", tone: "professional", emphasis: [] }),
+      layoutDirectives: JSON.parse(JSON.stringify(baseJsonCv.metadata.layoutDirectives)),
+    };
+  }
+  if (!Array.isArray(merged.sections)) merged.sections = [];
+  if (!merged.skills) merged.skills = { categories: [] };
+  if (!merged.contact) merged.contact = {};
+
+  return merged;
+}
+
+function cleanMarkdownArtifacts(markdown: string): string {
+  return markdown
+    .replace(/```(?:json|markdown|md)?/gi, "")
+    .replace(/^\s*#{1,6}\s*(?:JsonCv|JSON CV|Markdown)\s*$/gim, "")
+    .replace(/^\s*\*\*(?:JsonCv|JSON CV|Markdown)\*\*\s*$/gim, "")
+    .replace(/^\s*(?:JsonCv|JSON CV|Markdown)\s*:\s*$/gim, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function cleanJsonCvMarkdownArtifacts(jsonCv: JsonCv, log: Logger): JsonCv {
+  const cv = JSON.parse(JSON.stringify(jsonCv)) as JsonCv;
+  let removedEntries = 0;
+  let cleanedFields = 0;
+
+  const cleanText = (value: unknown): string => {
+    if (typeof value !== "string") return "";
+    const before = value;
+    let next = value
+      .replace(/```(?:json|markdown|md)?/gi, "")
+      .replace(/^\s*#{1,6}\s*/g, "")
+      .replace(/\*\*/g, "")
+      .replace(/^\s*(?:JsonCv|JSON CV|Markdown)\s*:?\s*$/i, "")
+      .trim();
+    if (next !== before) cleanedFields++;
+    return next;
+  };
+
+  const isArtifact = (value: unknown): boolean => {
+    if (typeof value !== "string") return false;
+    const v = value.trim();
+    return (
+      !v ||
+      /^#{1,6}\s/.test(v) ||
+      /^\*\*[^*]+\*\*$/.test(v) ||
+      /^(JsonCv|JSON CV|Markdown)\s*:?$/i.test(v) ||
+      /^```/.test(v)
+    );
+  };
+
+  cv.name = cleanText(cv.name) || cv.name || "";
+  cv.title = cleanText(cv.title) || cv.title || "";
+  cv.summary = cleanText(cv.summary);
+
+  const cleanedContact: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(cv.contact ?? {})) {
+    const cleanedValue = cleanText(value);
+    if (cleanedValue && !isArtifact(cleanedValue)) cleanedContact[key] = cleanedValue;
+  }
+  cv.contact = cleanedContact;
+
+  cv.skills = cv.skills ?? { categories: [] };
+  cv.skills.categories = (cv.skills.categories ?? [])
+    .map((cat) => ({
+      name: cleanText(cat.name) || "Skills",
+      items: (cat.items ?? []).map(cleanText).filter((item) => item && !isArtifact(item)),
+    }))
+    .filter((cat) => cat.items.length > 0);
+
+  cv.sections = (cv.sections ?? []).map((section) => {
+    const entries = (section.entries ?? [])
+      .map((entry) => ({
+        ...entry,
+        heading: cleanText(entry.heading),
+        subheading: cleanText(entry.subheading),
+        date: cleanText(entry.date),
+        description: cleanText(entry.description),
+        bullets: (entry.bullets ?? []).map(cleanText).filter((b) => b && !isArtifact(b)),
+        tags: (entry.tags ?? []).map(cleanText).filter((t) => t && !isArtifact(t)),
+      }))
+      .filter((entry) => {
+        const keep = !!(entry.heading || entry.subheading || entry.date || entry.description || entry.bullets.length || entry.tags?.length);
+        if (!keep || isArtifact(entry.heading)) removedEntries++;
+        return keep && !isArtifact(entry.heading);
+      });
+
+    return { ...section, title: cleanText(section.title) || section.title, entries };
+  });
+
+  if (removedEntries || cleanedFields) {
+    log.warn("WRITER_REFINE", `Cleaned markdown artifacts from JsonCv | cleanedFields=${cleanedFields} | removedEntries=${removedEntries}`);
+  }
+
+  return cv;
 }
 
 
@@ -579,6 +811,278 @@ function parseRefinementCommands(instruction: string): string[] {
   return commands.length > 0 ? commands : [instruction.trim()];
 }
 
+function isMarkdownNoiseLine(line: string): boolean {
+  const normalized = line.replace(/^[-*•]\s*/, "").trim();
+
+  return (
+    !normalized ||
+    normalized.startsWith("###") ||
+    normalized.startsWith("##") ||
+    normalized.startsWith("#") ||
+    /^\*\*[^:*]+\*\*\s*$/.test(normalized) ||
+    /^jsoncv\b/i.test(normalized) ||
+    /^markdown\b/i.test(normalized) ||
+    /^current\s+jsoncv\b/i.test(normalized) ||
+    /^current\s+markdown\b/i.test(normalized) ||
+    /^updated\s+jsoncv\b/i.test(normalized) ||
+    /^updated\s+markdown\b/i.test(normalized) ||
+    /^```/.test(normalized)
+  );
+}
+
+function emptyEntry(): JsonCv["sections"][number]["entries"][number] {
+  return {
+    heading: "",
+    subheading: "",
+    bullets: [],
+  };
+}
+
+function parseStructuredEntryLine(line: string): JsonCv["sections"][number]["entries"][number] {
+  const normalized = line.replace(/^[-*•]\s*/, "").trim();
+
+  if (isMarkdownNoiseLine(normalized)) {
+    return emptyEntry();
+  }
+
+  const yearMatch = normalized.match(/\b(19|20)\d{2}\b/);
+  const date = yearMatch?.[0] ?? "";
+
+  let main = normalized;
+  let description = "";
+
+  const colonIdx = main.indexOf(":");
+  if (colonIdx >= 0) {
+    description = main.slice(colonIdx + 1).trim();
+    main = main.slice(0, colonIdx).trim();
+  }
+
+  main = main.replace(/\(\s*(19|20)\d{2}\s*\)/g, "").trim();
+
+  const parts = main
+    .split(/\s+[—–]\s+|\s+-\s+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  return {
+    heading: parts[0] ?? "",
+    subheading: parts[1] ?? "",
+    date,
+    description,
+    bullets: [],
+  };
+}
+//helpers of SyncEducationMarkdown / syncCertificationsFromMarkdown / syncProjectsFromMarkdown
+function parseHeadingBulletEntries(content: string): JsonCv["sections"][number]["entries"] {
+  const chunks = content
+    .split(/\n(?=###\s+|\*\*)/)
+    .map((c) => c.trim())
+    .filter(Boolean);
+
+  if (chunks.length <= 1 && /^[-*•]\s+/m.test(content)) {
+    return content
+      .split("\n")
+      .map((l) => l.replace(/^[-*•]\s*/, "").trim())
+      .filter((l) => l.length > 0 && !isMarkdownNoiseLine(l))
+      .map((line) => ({
+        heading: line,
+        subheading: "",
+        bullets: [],
+      }));
+  }
+
+  return chunks.map((chunk) => {
+    const lines = chunk.split("\n").map((l) => l.trim()).filter((l) => l.length > 0 && !isMarkdownNoiseLine(l));
+    const headingLine = lines.shift() ?? "";
+    const heading = headingLine
+      .replace(/^###\s*/, "")
+      .replace(/^\*\*|\*\*$/g, "")
+      .trim();
+
+    const bullets = lines
+      .filter((l) => /^[-*•]\s+/.test(l))
+      .map((l) => l.replace(/^[-*•]\s+/, "").trim());
+
+    const description = lines
+      .filter((l) => !/^[-*•]\s+/.test(l))
+      .join(" ");
+
+    return {
+      heading,
+      subheading: "",
+      bullets,
+      description,
+    };
+  }).filter((e) => e.heading || e.bullets.length || e.description);
+}
+
+
+
+
+function syncContactFromMarkdown(cv: JsonCv, markdown: string, log: Logger): void {
+  const content = extractMarkdownSection(markdown, "Contact|Contacts|Contact\\s+Info|Contact\\s+Information", log);
+  if (!content) return;
+
+  const oldCount = Object.keys(cv.contact ?? {}).length;
+  const nextContact: Record<string, string | undefined> = {};
+
+  const lines = content
+    .split(/\n|\s*\|\s*/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+    const m = line.match(/^([A-Za-z][\w\s.-]{1,40}):\s*(.+)$/);
+    if (!m) continue;
+
+    const key = m[1].trim().toLowerCase().replace(/\s+/g, "_");
+    const value = m[2].trim();
+
+    if (!value) continue;
+    nextContact[key] = value;
+  }
+
+  if (Object.keys(nextContact).length > 0) {
+    cv.contact = nextContact;
+    log.info(
+      "WRITER_REFINE",
+      `Synced contact from markdown | before=${oldCount} | after=${Object.keys(cv.contact).length} | keys=${Object.keys(cv.contact).join(", ")}`
+    );
+  }
+}
+
+
+function syncEducationFromMarkdown(cv: JsonCv, markdown: string, log: Logger): void {
+  const content = extractMarkdownSection(markdown, "Education|Academic\\s+Background", log);
+  if (!content) return;
+
+  const entries = content
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !isMarkdownNoiseLine(l))
+    .map(parseStructuredEntryLine)
+    .filter((e) => e.heading);
+
+  upsertSection(cv, "education", "Education", entries);
+
+  log.info(
+    "WRITER_REFINE",
+    `Synced education | count=${entries.length} | entries=${entries.map((e) => `${e.heading}/${e.subheading || ""}/${e.date || ""}`).join(" ; ")}`
+  );
+}
+
+
+//helper syncCertificationsFromMarkdown
+function parseCertificationLine(line: string): JsonCv["sections"][number]["entries"][number] {
+  const normalized = line.trim();
+
+  const yearMatch = normalized.match(/\b(19|20)\d{2}\b/);
+  const year = yearMatch?.[0] ?? "";
+
+  let main = normalized;
+  let description = "";
+
+  const colonIdx = normalized.indexOf(":");
+  if (colonIdx >= 0) {
+    main = normalized.slice(0, colonIdx).trim();
+    description = normalized.slice(colonIdx + 1).trim();
+  }
+
+  main = main.replace(/\(\s*(19|20)\d{2}\s*\)/g, "").trim();
+
+  const parts = main
+    .split(/\s+[—–]\s+|\s+-\s+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const heading = parts[0] ?? "";
+  const subheading = parts[1] ?? "";
+
+  return {
+    heading,
+    subheading,
+    date: year,
+    bullets: [],
+    description,
+  };
+}
+
+function syncCertificationsFromMarkdown(cv: JsonCv, markdown: string, log: Logger): void {
+  const content = extractMarkdownSection(markdown, "Certifications|Certification|Licenses", log);
+  if (!content) return;
+
+  const entries = content
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !isMarkdownNoiseLine(l))
+    .map(parseStructuredEntryLine)
+    .filter((e) => e.heading);
+
+  upsertSection(cv, "certifications", "Certifications", entries);
+
+  log.info(
+    "WRITER_REFINE",
+    `Synced certifications | count=${entries.length} | entries=${entries.map((e) => `${e.heading}/${e.subheading || ""}/${e.date || ""}`).join(" ; ")}`
+  );
+}
+
+function syncProjectsFromMarkdown(cv: JsonCv, markdown: string): void {
+  const content = extractMarkdownSection(markdown, "Projects|Project|Personal\\s+Projects");
+  if (!content) return;
+
+  const entries = parseHeadingBulletEntries(content);
+  upsertSection(cv, "projects", "Projects", entries);
+}
+
+// Manually edited sections (such as experience, descriptions, bullet) have to be in jsonCv.sections
+function syncExperienceFromMarkdown(cv: JsonCv, markdown: string, log: Logger): void {
+  const content = extractMarkdownSection(
+    markdown,
+    "Professional\\s+Experience|Work\\s+Experience|Experience",
+    log
+  );
+  if (!content) return;
+
+  const chunks = content
+    .split(/\n(?=###\s+)/)
+    .map((c) => c.trim())
+    .filter((c) => c.length > 0 && !/^jsoncv\b/i.test(c) && !/^markdown\b/i.test(c));
+
+  const entries = chunks.map((chunk) => {
+    const lines = chunk.split("\n").map((l) => l.trim()).filter((l) => l.length > 0 && !isMarkdownNoiseLine(l));
+    const headingLine = (lines.shift() ?? "").replace(/^###\s*/, "").trim();
+    if (isMarkdownNoiseLine(headingLine)) return emptyEntry();
+
+    const headingParts = headingLine.split(/\s+[—–]\s+|\s+-\s+/).map((p) => p.trim());
+
+    const metaLine = lines.length && !/^[-*•]\s+/.test(lines[0]) ? lines.shift() ?? "" : "";
+    const metaParts = metaLine.split(/\s+·\s+/).map((p) => p.trim());
+
+    const bullets = lines
+      .filter((l) => /^[-*•]\s+/.test(l))
+      .map((l) => l.replace(/^[-*•]\s+/, "").trim());
+
+    const description = lines
+      .filter((l) => !/^[-*•]\s+/.test(l))
+      .join(" ");
+
+    return {
+      heading: headingParts[0] ?? "",
+      subheading: headingParts[1] ?? "",
+      date: metaParts[0] ?? "",
+      description,
+      bullets,
+    };
+  }).filter((e) => e.heading || e.bullets.length || e.description);
+
+  upsertSection(cv, "experience", "Professional Experience", entries);
+
+  log.info(
+    "WRITER_REFINE",
+    `Synced experience | count=${entries.length} | entries=${entries.map((e) => `${e.heading}/${e.subheading || ""}/${e.date || ""}`).join(" ; ")}`
+  );
+}
+
 /** When no instruction: parse Markdown and sync structured JsonCv to match. */
 function syncJsonCvToMarkdown(jsonCv: JsonCv, markdown: string, title: string, log: Logger): WriterResult {
   log.info("WRITER_REFINE", "Syncing JsonCv to markdown (no instruction)");
@@ -588,35 +1092,90 @@ function syncJsonCvToMarkdown(jsonCv: JsonCv, markdown: string, title: string, l
   return { markdown, jsonCv: validated, title: validated.name || title };
 }
 
+/** helper */
+function extractMarkdownSection(markdown: string, titlePattern: string, log?: Logger): string {
+  const regex = new RegExp(
+    String.raw`(?:^|\n)(?:##\s*(?:${titlePattern})\s*|\*\*(?:${titlePattern})\*\*)\s*\n\n?([\s\S]*?)(?=\n(?:##\s|\*\*[^*\n]+\*\*)|$)`,
+    "i"
+  );
+
+  const match = regex.exec(markdown);
+  const content = match?.[1]?.trim() ?? "";
+
+  log?.info(
+    "WRITER_REFINE",
+    `extractMarkdownSection("${titlePattern}") | found=${content.length > 0} | length=${content.length}`
+  );
+
+  return content;
+}
+
 /** Attempt to extract section data from Markdown and sync into JsonCv. */
-function attemptMarkdownSync(jsonCv: JsonCv, markdown: string, log: Logger, instruction?: string): JsonCv {
+function attemptMarkdownSync(
+  jsonCv: JsonCv,
+  markdown: string,
+  log: Logger,
+  instruction?: string,
+  options?: { strongSync?: boolean }
+): JsonCv {
   const cv = JSON.parse(JSON.stringify(jsonCv)) as JsonCv;
+  const strongSync = !!options?.strongSync;
 
-  // Extract summary from markdown (text between ## Summary and next ##)
-  const summaryMatch = markdown.match(/##\s*(?:Professional\s+)?Summary\s*\n\n?([\s\S]*?)(?=\n##\s|\n#{3,}\s|$)/i);
-  if (summaryMatch) cv.summary = summaryMatch[1].trim();
+  log.info(
+    "WRITER_REFINE",
+    `Markdown sync mode: ${strongSync ? "strong" : "light"}`
+  );
 
-  // Scan markdown for present section headings
+  // 1) Scan markdown headings FIRST.
+  // This must happen before any code reads presentSectionTypes.
   const presentSectionTypes = new Set<string>();
   const sectionRegex = /(?:##\s*(.+)|\*\*(.+)\*\*)\s*\n/g;
-  let match;
+  let match: RegExpExecArray | null;
+
   while ((match = sectionRegex.exec(markdown)) !== null) {
     const header = (match[1] || match[2] || "").trim().toLowerCase();
-    // Map common header names to section types
+
     const typeMap: Record<string, string> = {
-      "professional experience": "experience", "experience": "experience", "work experience": "experience",
-      "education": "education", "academic": "education", "academic background": "education",
-      "skills": "skills", "core competencies": "skills", "technical skills": "skills",
-      "certifications": "certifications", "certification": "certifications", "licenses": "certifications",
-      "projects": "projects", "project": "projects", "personal projects": "projects",
-      "awards": "awards", "honors": "awards", "awards & honors": "awards", "awards and honors": "awards",
-      "publications": "publications", "publication": "publications", "papers": "publications",
-      "volunteer": "volunteer", "volunteer experience": "volunteer", "volunteering": "volunteer", "volunteers": "volunteer",
-      "interests": "interests", "hobbies": "interests", "personal interests": "interests",
-      "languages": "languages", "language": "languages", "linguistic skills": "languages",
-      "summary": "summary", "professional summary": "summary",
-      "contact": "contact", "contact info": "contact", "contact information": "contact",
+      "professional experience": "experience",
+      "experience": "experience",
+      "work experience": "experience",
+      "education": "education",
+      "academic": "education",
+      "academic background": "education",
+      "skills": "skills",
+      "core competencies": "skills",
+      "technical skills": "skills",
+      "certifications": "certifications",
+      "certification": "certifications",
+      "licenses": "certifications",
+      "projects": "projects",
+      "project": "projects",
+      "personal projects": "projects",
+      "awards": "awards",
+      "honors": "awards",
+      "awards & honors": "awards",
+      "awards and honors": "awards",
+      "publications": "publications",
+      "publication": "publications",
+      "papers": "publications",
+      "volunteer": "volunteer",
+      "volunteer experience": "volunteer",
+      "volunteering": "volunteer",
+      "volunteers": "volunteer",
+      "interests": "interests",
+      "hobbies": "interests",
+      "personal interests": "interests",
+      "languages": "languages",
+      "language": "languages",
+      "linguistic skills": "languages",
+      "summary": "summary",
+      "professional summary": "summary",
+      "contact": "contact",
+      "contacts": "contact",
+      "contact info": "contact",
+      "contact information": "contact",
     };
+
     for (const [key, type] of Object.entries(typeMap)) {
       if (header.includes(key)) {
         presentSectionTypes.add(type);
@@ -628,16 +1187,86 @@ function attemptMarkdownSync(jsonCv: JsonCv, markdown: string, log: Logger, inst
   log.info("WRITER_REFINE", "Markdown scan detected sections: " + [...presentSectionTypes].join(", "));
   log.info("WRITER_REFINE", "Existing JsonCv sections: " + cv.sections.map((s) => s.type).join(", "));
 
+  // 2) In strong sync, parse Markdown into JsonCv before emptying missing sections.
+  if (strongSync) {
+    const beforeCounts = cv.sections.map((s) => `${s.type}:${s.entries.length}`).join(", ");
+
+    syncSectionEntriesFromMarkdown(cv, markdown, log);
+
+    const afterCounts = cv.sections.map((s) => `${s.type}:${s.entries.length}`).join(", ");
+
+    log.info(
+      "WRITER_REFINE",
+      `Strong markdown sync parsed sections | before=[${beforeCounts}] | after=[${afterCounts}]`
+    );
+  }
+
+  // 3) Sync summary. In strong sync, missing Summary means user removed it.
+  const summaryContent = extractMarkdownSection(markdown, "Summary|Professional\\s+Summary", log);
+  if (summaryContent) {
+    cv.summary = summaryContent;
+    log.info("WRITER_REFINE", `Synced summary from markdown | length=${cv.summary.length}`);
+  } else if (strongSync && !presentSectionTypes.has("summary")) {
+    cv.summary = "";
+  }
+
+  // 4) In strong sync, if a section is absent from the edited Markdown, keep the
+  // section/composition stable but empty its data so the renderer omits it.
+  if (strongSync) {
+    const beforeEmptyState = [
+      `sections=${cv.sections.map((s) => `${s.type}:${s.entries.length}`).join(", ")}`,
+      `skills=${cv.skills?.categories?.length ?? 0}`,
+      `contact=${Object.keys(cv.contact ?? {}).length}`,
+      `summary=${cv.summary?.length ?? 0}`,
+    ].join(" | ");
+
+    const emptyableSectionTypes = [
+      "experience",
+      "education",
+      "certifications",
+      "projects",
+      "awards",
+      "publications",
+      "volunteer",
+      "interests",
+      "languages",
+    ];
+
+    for (const section of cv.sections) {
+      if (
+        emptyableSectionTypes.includes(section.type) &&
+        !presentSectionTypes.has(section.type)
+      ) {
+        section.entries = [];
+      }
+    }
+
+    if (!presentSectionTypes.has("skills")) {
+      cv.skills = { categories: [] };
+    }
+
+    if (!presentSectionTypes.has("contact")) {
+      cv.contact = {};
+    }
+
+    log.info(
+      "WRITER_REFINE",
+      `Strong sync emptied missing markdown sections | before=[${beforeEmptyState}] | after=[sections=${cv.sections.map((s) => `${s.type}:${s.entries.length}`).join(", ")} | skills=${cv.skills?.categories?.length ?? 0} | contact=${Object.keys(cv.contact ?? {}).length} | summary=${cv.summary?.length ?? 0}]`
+    );
+
+    log.info(
+      "WRITER_REFINE",
+      `FINAL STATE | contactKeys=${Object.keys(cv.contact ?? {}).join(", ")} | sections=${cv.sections.map((s) => `${s.type}:${s.entries.length}`).join(", ")} | certs=${(cv.sections.find((s) => s.type === "certifications")?.entries ?? []).map((e) => `${e.heading}/${e.subheading || ""}/${e.date || ""}`).join(" ; ")}`
+    );
+  }
+
   // ── Section removal policy ──
   // By default, PRESERVE all existing sections. Only remove sections when
-  // the user EXPLICITLY asks to remove/delete/drop them. This prevents
-  // designer-only instructions (e.g. "make certifications as card") from
-  // accidentally deleting content sections like Languages.
+  // the user EXPLICITLY asks to remove/delete/drop them.
   const lowerInstruction = (instruction || "").toLowerCase();
   const explicitlyRequestedRemoval = /\b(remove|delete|drop|eliminate|get rid of|cut|omit)\b/i.test(lowerInstruction);
 
   if (explicitlyRequestedRemoval) {
-    // User explicitly asked to remove something — parse which sections
     const removalTargets = new Set<string>();
     const removalAliases: Record<string, string[]> = {
       experience: ["experience", "work experience", "professional experience", "experiences"],
@@ -666,86 +1295,199 @@ function attemptMarkdownSync(jsonCv: JsonCv, markdown: string, log: Logger, inst
       if (toRemove.length > 0) {
         const removedTypes = toRemove.map((s) => s.type);
         cv.sections = cv.sections.filter((s) => !removalTargets.has(s.type));
-        if (!cv.metadata) cv.metadata = {};
-        cv.metadata.removedSections = [...(cv.metadata.removedSections ?? []), ...removedTypes];
+        if (!cv.metadata) cv.metadata = { targetRole: "", tone: "professional", emphasis: [] };
+        (cv.metadata as Record<string, unknown>).removedSections = [
+          ...(((cv.metadata as Record<string, unknown>).removedSections as string[] | undefined) ?? []),
+          ...removedTypes,
+        ];
         log.info("WRITER_REFINE", "Explicitly removed sections: " + removedTypes.join(", "));
       }
+
+      if (removalTargets.has("skills")) cv.skills = { categories: [] };
+      if (removalTargets.has("contact")) cv.contact = {};
+      if (removalTargets.has("summary")) cv.summary = "";
     }
   }
 
-  // Preserve any existing section that was not explicitly removed
-  const preservedSections = cv.sections.filter((s) => !cv.metadata?.removedSections?.includes(s.type));
+  const removedSections = ((cv.metadata as Record<string, unknown> | undefined)?.removedSections as string[] | undefined) ?? [];
+  const preservedSections = cv.sections.filter((s) => !removedSections.includes(s.type));
   log.info("WRITER_REFINE", "Preserved sections: " + preservedSections.map((s) => s.type).join(", "));
 
-  // Sync contact info from markdown
-  // Contacts are written one per line: "key: value" — NEVER joined with " | "
-  const contactSection = markdown.match(/(?:\*\*Contact:?\*\*|##\s*Contact)\s*\n\n?([\s\S]*?)(?=\n\*\*|\n##\s|$)/i);
-  if (contactSection) {
-    // Clear existing contacts to prevent accumulation across refinement passes
-    const oldContact = { ...cv.contact };
-    cv.contact = {};
-    // Split by both newlines AND " | " (handles both old and new format)
-    const rawLines = contactSection[1].split(/\n|\s*\|\s*/).filter((l) => l.trim());
-    for (const line of rawLines) {
-      const m = line.match(/^([A-Za-z][\w\s]+):\s*(.+)$/);
-      if (m && !m[1].includes("-") && !m[1].includes("*")) {
-        const key = m[1].trim().toLowerCase().replace(/\s+/g, "_");
-        const value = m[2].trim();
-        // Sanity check: reject lines that look like skills or certifications
-        if (value.includes(",") && value.length > 40 && !value.includes("http")) continue;
-        // Deduplicate: skip if this exact key:value already exists
-        if (cv.contact[key] === value) continue;
-        cv.contact[key] = value;
-      }
-    }
-    // If parsing produced nothing, restore old contacts (defensive)
-    if (Object.keys(cv.contact).length === 0) {
-      cv.contact = oldContact;
-    }
-  }
+  // In strongSync these are already handled by syncSectionEntriesFromMarkdown().
+  // In light sync, we still sync them here.
+  if (!strongSync) {
+    syncContactFromMarkdown(cv, markdown, log);
+    syncCertificationsFromMarkdown(cv, markdown, log);
 
-  // Sync certifications from markdown (extract bullet lines from Certifications section)
-  const certMatch = markdown.match(/##\s*Certifications\s*\n\n?([\s\S]*?)(?=\n##\s|$)/i);
-  if (certMatch) {
-    const certSection = cv.sections.find((s) => s.type === "certifications");
-    if (certSection) {
-      const certBullets = certMatch[1].split("\n").map((l) => l.replace(/^[-*•]\s*/, "").trim()).filter((l) => l.length > 3);
-      certSection.entries = certBullets.map((b) => {
-        const parts = b.split(/\s*[—–-]\s*/);
-        return { heading: parts[0], subheading: parts[1] || "", date: parts[2] || "", bullets: [] };
-      });
-    }
-  }
+    const langMatch = markdown.match(/(?:\*\*Languages:?\*\*|##\s*Languages)\s*\n\n?([\s\S]*?)(?=\n\*\*|\n##\s|$)/i);
+    if (langMatch) {
+      const langLines = langMatch[1]
+        .split("\n")
+        .map((l) => l.replace(/^[-*•]\s*/, "").trim())
+        .filter((l) => l.length > 0);
 
-  // Sync languages from markdown (extract from Languages section)
-  // Pattern: "- Italian — Native" or "- English (B2)" or "- French - Fluent"
-  const langMatch = markdown.match(/(?:\*\*Languages:?\*\*|##\s*Languages)\s*\n\n?([\s\S]*?)(?=\n\*\*|\n##\s|$)/i);
-  if (langMatch) {
-    const langLines = langMatch[1].split("\n").map((l) => l.replace(/^[-*•]\s*/, "").trim()).filter((l) => l.length > 0);
-    const langEntries = langLines.map((line) => {
-      // Match "Language — Proficiency" or "Language - Proficiency" or "Language (Proficiency)"
-      const parts = line.match(/^([^(—–-]+)(?:\s*[—–-]\s*|\s*\(\s*)([^)]+)?/);
-      if (parts) {
-        return { heading: parts[1].trim(), subheading: (parts[2] || "").trim(), bullets: [] as string[] };
-      }
-      return { heading: line, subheading: "", bullets: [] as string[] };
-    }).filter((e) => e.heading.length > 0);
+      const langEntries = langLines
+        .map((line) => {
+          const parts = line.match(/^([^(—–-]+)(?:\s*[—–-]\s*|\s*\(\s*)([^)]+)?/);
+          if (parts) {
+            return {
+              heading: parts[1].trim(),
+              subheading: (parts[2] || "").trim(),
+              bullets: [] as string[],
+            };
+          }
 
-    if (langEntries.length > 0) {
-      const existingLangIdx = cv.sections.findIndex((s) => s.type === "languages");
-      if (existingLangIdx >= 0) {
-        cv.sections[existingLangIdx].entries = langEntries;
-      } else {
-        cv.sections.push({ type: "languages", title: "Languages", entries: langEntries });
+          return {
+            heading: line,
+            subheading: "",
+            bullets: [] as string[],
+          };
+        })
+        .filter((e) => e.heading.length > 0);
+
+      if (langEntries.length > 0) {
+        upsertSection(cv, "languages", "Languages", langEntries);
+        log.info("WRITER_REFINE", `Synced languages from markdown: ${langEntries.length} language(s)`);
       }
-      log.info("WRITER_REFINE", `Synced languages from markdown: ${langEntries.length} language(s)`);
     }
   }
 
   // Preserve layoutDirectives during sync
   if (!cv.metadata) cv.metadata = { targetRole: "", tone: "professional", emphasis: [] };
 
+  sanitizeMarkdownArtifactsFromJsonCv(cv, log);
+
   return cv;
+}
+
+function sanitizeMarkdownArtifactsFromJsonCv(cv: JsonCv, log: Logger): void {
+  let removedEntries = 0;
+  let cleanedBullets = 0;
+
+  for (const section of cv.sections ?? []) {
+    const before = section.entries.length;
+
+    section.entries = section.entries
+      .map((entry) => ({
+        ...entry,
+        heading: (entry.heading || "").replace(/^#{1,6}\s*/, "").replace(/^\*\*|\*\*$/g, "").trim(),
+        subheading: entry.subheading?.replace(/^#{1,6}\s*/, "").replace(/^\*\*|\*\*$/g, "").trim(),
+        date: entry.date?.replace(/^#{1,6}\s*/, "").replace(/^\*\*|\*\*$/g, "").trim(),
+        description: entry.description?.replace(/^#{1,6}\s*/, "").replace(/^\*\*|\*\*$/g, "").trim(),
+        bullets: (entry.bullets || [])
+          .map((b) => b.replace(/^#{1,6}\s*/, "").replace(/^\*\*|\*\*$/g, "").trim())
+          .filter((b) => {
+            const keep = b.length > 0 && !isMarkdownNoiseLine(b);
+            if (!keep) cleanedBullets++;
+            return keep;
+          }),
+      }))
+      .filter((entry) => {
+        const heading = entry.heading || "";
+        const keep = (heading.length > 0 || entry.description?.trim() || entry.bullets.length > 0) && !isMarkdownNoiseLine(heading);
+        if (!keep) removedEntries++;
+        return keep;
+      });
+
+    if (section.entries.length !== before) {
+      log.info("WRITER_REFINE", `Sanitized markdown artifacts in section ${section.type} | before=${before} | after=${section.entries.length}`);
+    }
+  }
+
+  if (removedEntries > 0 || cleanedBullets > 0) {
+    log.info("WRITER_REFINE", `Sanitized markdown artifacts | removedEntries=${removedEntries} | cleanedBullets=${cleanedBullets}`);
+  }
+}
+
+function syncSectionEntriesFromMarkdown(cv: JsonCv, markdown: string, log: Logger): void {
+  const syncSimpleBulletSection = (type: string, title: string, titlePattern: string) => {
+    const content = extractMarkdownSection(markdown, titlePattern, log);
+    if (!content) return;
+
+    const entries = content
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .map(parseStructuredEntryLine)
+      .filter((e) => e.heading);
+
+    upsertSection(cv, type, title, entries);
+
+    log.info(
+      "WRITER_REFINE",
+      `Synced ${type} | count=${entries.length}`
+    );
+  };
+
+  const syncSkillsFromMarkdown = (cv: JsonCv, markdown: string, log: Logger): void => {
+    const content = extractMarkdownSection(markdown, "Skills|Core\\s+Competencies|Technical\\s+Skills", log);
+    if (!content) return;
+
+    const categories: Array<{ name: string; items: string[] }> = [];
+
+    for (const rawLine of content.split("\n")) {
+      const line = rawLine.trim();
+      if (!line || isMarkdownNoiseLine(line)) continue;
+
+      const cleaned = line.replace(/^[-*•]\s*/, "");
+
+      const match =
+        cleaned.match(/^\*\*([^:*]+):?\*\*\s*(.+)$/) ||
+        cleaned.match(/^([^:]+):\s*(.+)$/);
+
+      if (!match) continue;
+
+      categories.push({
+        name: match[1].trim(),
+        items: match[2].split(",").map((s) => s.trim()).filter(Boolean),
+      });
+    }
+
+    if (categories.length > 0) {
+      cv.skills = { categories };
+      log.info(
+        "WRITER_REFINE",
+        `Synced skills | categories=${categories.map((c) => `${c.name}:${c.items.length}`).join(", ")}`
+      );
+    }
+  };
+
+  syncContactFromMarkdown(cv, markdown, log);
+  syncSkillsFromMarkdown(cv, markdown, log);
+  syncExperienceFromMarkdown(cv, markdown, log);
+  syncEducationFromMarkdown(cv, markdown, log);
+  syncCertificationsFromMarkdown(cv, markdown, log);
+  syncProjectsFromMarkdown(cv, markdown);
+
+  syncSimpleBulletSection("awards", "Awards & Honors", "Awards(?:\\s*&\\s*Honors)?|Honors");
+  syncSimpleBulletSection("publications", "Publications", "Publications|Papers");
+  syncSimpleBulletSection("volunteer", "Volunteer Experience", "Volunteer(?:\\s+Experience)?|Volunteering");
+  syncSimpleBulletSection("interests", "Interests", "Interests|Hobbies");
+  syncSimpleBulletSection("languages", "Languages", "Languages");
+
+  log.info("WRITER_REFINE", "Strong sync parsed markdown sections into JsonCv");
+}
+
+// No JsonCV >> but derived from markdown
+function upsertSection(
+  cv: JsonCv,
+  type: string,
+  title: string,
+  entries: JsonCv["sections"][number]["entries"]
+): void {
+  if (!entries.length) return;
+
+  const idx = cv.sections.findIndex((s) => s.type === type);
+
+  if (idx >= 0) {
+    cv.sections[idx] = {
+      ...cv.sections[idx],
+      title,
+      entries,
+    };
+  } else {
+    cv.sections.push({ type, title, entries });
+  }
 }
 
 /** Detects if the user instruction explicitly requests section removal. Returns array of section types to remove. */

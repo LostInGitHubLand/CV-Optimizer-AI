@@ -30,9 +30,16 @@ export async function executeRefinement(
     // 2. Get version data
     const latest = await getLatestVersion(jobId);
 
-    const currentMarkdown = editedMarkdown?.trim()
+    const hasEditedMarkdown = !!editedMarkdown?.trim();
+
+    const currentMarkdown = hasEditedMarkdown
       ? editedMarkdown
       : (latest?.markdown_content || job.markdownOutput || "");
+
+    log.info(
+      "REFINE_SERVICE",
+      `Markdown source: ${hasEditedMarkdown ? "editedMarkdown" : "storedMarkdown"} | length=${currentMarkdown.length}`
+    );
 
     const currentJsonCv = latest?.json_cv ?? job.jsonCv;
 
@@ -71,7 +78,8 @@ export async function executeRefinement(
       designerInstruction,
       jobAdvert,
       currentDesignComposition,
-      log
+      log,
+      hasEditedMarkdown
     ).catch((err) => {
       const msg = err instanceof Error ? err.message : String(err);
       log.error("REFINE_SERVICE", `Refinement failed: ${msg}`);

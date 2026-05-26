@@ -18,7 +18,6 @@ const WRITER_SUGGESTIONS = [
   "Make the summary more concise and punchy",
   "Add emphasis on cloud architecture and DevOps",
   "Use stronger action verbs for the latest role",
-  "Quantify achievements with specific metrics",
   "Highlight leadership experience more prominently",
   "Reorder experience to put most relevant first",
 ];
@@ -58,20 +57,38 @@ export default function RefinementPanel({
     setHasMarkdownEdit(false);
   }, [currentMarkdown]);
 
-  // Track if the user has edited the markdown (for the dot indicator)
   const handleMarkdownChange = (value: string) => {
-    setMarkdownText(value);
-    setHasMarkdownEdit(value !== currentMarkdown);
-  };
+  const changed = value !== currentMarkdown;
 
-  const handleRefine = () => {
-    // If the user has edited the markdown (even if on Writer tab), pass the edited version
-    // This ensures markdown changes are always preserved when refining
-    const editedMarkdown = hasMarkdownEdit ? markdownText : null;
-    onRefine(writerText.trim(), designerText.trim(), editedMarkdown);
-    setWriterText("");
-    setDesignerText("");
-  };
+  console.log("[REFINE_UI] Markdown changed", {
+    newLength: value.length,
+    currentLength: currentMarkdown.length,
+    changed,
+  });
+
+  setMarkdownText(value);
+  setHasMarkdownEdit(changed);
+};
+
+const handleRefine = () => {
+  const editedMarkdown = hasMarkdownEdit ? markdownText : null;
+
+  console.log("[REFINE_UI] Refine clicked", {
+    activeTab,
+    hasMarkdownEdit,
+    hasEditedMarkdownPayload: !!editedMarkdown,
+    writerTextLength: writerText.trim().length,
+    designerTextLength: designerText.trim().length,
+    markdownLength: markdownText.length,
+    currentMarkdownLength: currentMarkdown.length,
+  });
+
+  onRefine(writerText.trim(), designerText.trim(), editedMarkdown);
+  setWriterText("");
+  setDesignerText("");
+};
+
+
 
   const insertSuggestion = (suggestion: string) => {
     if (activeTab === "writer") {

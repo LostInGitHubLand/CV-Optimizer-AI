@@ -34,7 +34,8 @@ export async function runRefinementWithResilience(
   designerInstruction: string,
   jobAdvert: string,
   currentDesignComposition: DesignComposition | undefined,
-  parentLog: ReturnType<typeof logger>
+  parentLog: ReturnType<typeof logger>,
+  markdownEdited = false
 ): Promise<void> {
   const log = parentLog.child({ sessionId: `r_${Date.now()}` });
   recordRefineSession(jobId);
@@ -74,9 +75,16 @@ export async function runRefinementWithResilience(
         currentMarkdown: markdown,
         instruction: writerInstruction,
         title: (jsonCv as Record<string, string>).name ?? (jsonCv as Record<string, string>).title ?? "",
+        markdownEdited,
       }, log, (p, g) => recordTokens(jobId, "WRITER", "refine", p, g));
+      
       refined = result;
-      log.info("WRITER_REFINE", "Sync/AI complete", timer);
+
+      log.info(
+        "WRITER_REFINE",
+        `Sync/AI complete | markdownLength=${refined.markdown.length} | sections=${((refined.jsonCv as Record<string, unknown>).sections as Array<{ type: string; entries?: unknown[] }> | undefined)?.map((s) => `${s.type}:${s.entries?.length ?? 0}`).join(", ") ?? "none"}`,
+        timer
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log.warn("WRITER_REFINE", `AI failed: ${msg}. Using markdown as-is.`, startTimer("WRITER_REFINE"));
@@ -122,6 +130,11 @@ export async function runRefinementWithResilience(
 
       // Fallback: re-render with the SAME composition — NEVER infer from domain
       const designState = resolveDesignState(currentDesignComposition, log);
+      log.info(
+        "DESIGNER_FALLBACK",
+        `Rendering fallback from JsonCv | markdownHasTEST=${refined.markdown.includes("TEST_EDIT")} | jsonCvHasTEST=${JSON.stringify(refined.jsonCv).includes("TEST_EDIT")}`
+      );
+      
       const rawHtml = renderSemanticHtml(refined.jsonCv as JsonCv, currentDesignComposition, designState);
       const html = sanitizeCvHtml(rawHtml);
       const pdfPath = `/tmp/${jobId}_refine_${Date.now()}.pdf`;

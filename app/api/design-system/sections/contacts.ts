@@ -40,6 +40,16 @@ export function extractContacts(cv: JsonCv): ContactItem[] {
       items.push({ key: f.key, value: v, icon });
     }
   }
+
+  const known = new Set(fields.map((f) => f.key));
+
+  for (const [key, value] of Object.entries(cv.contact ?? {})) {
+    if (!value || known.has(key)) continue;
+
+    const { icon } = getContactIcon(key);
+    items.push({ key, value, icon });
+  }
+
   return items;
 }
 

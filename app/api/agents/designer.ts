@@ -84,6 +84,10 @@ export async function runDesignerMain(
   // 1. Sanitize
   const cv = sanitizeJsonCv(jsonCv);
 
+  log.info(
+    "DESIGNER_REFINE",
+    `Received JsonCv | name="${cv.name}" | title="${cv.title}" | sections=${cv.sections.map((s) => `${s.type}:${s.entries.length}`).join(", ")}`
+  );
   // 2. Infer initial composition from CV content + domain
   const designComposition = inferInitialComposition(cv, domain, log);
   log.info("DESIGNER_MAIN", `Composition: layout="${designComposition.layoutId}" theme="${designComposition.themeId}" domain="${domain}"`);

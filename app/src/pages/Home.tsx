@@ -146,6 +146,7 @@ export default function Home() {
 
   const refine = trpc.cv.refine.useMutation();
   const satisfy = trpc.cv.satisfied.useMutation();
+  const utils = trpc.useUtils();
   const restoreBackup = trpc.cv.restoreBackup.useMutation();
 
   const handleRefine = useCallback((writerInstruction: string, designerInstruction: string, editedMarkdown: string | null) => {
@@ -175,10 +176,16 @@ export default function Home() {
   const handleRestore = useCallback(() => {
     if (!effectiveJobId) return;
     restoreBackup.mutate({ jobId: effectiveJobId }, {
-      onSuccess: () => {
+      onSuccess: async () => {
+        if (effectiveJobId) {
+          await utils.cv.getMarkdown.invalidate({ jobId: effectiveJobId });
+          await utils.cv.getHtml.invalidate({ jobId: effectiveJobId });
+          await utils.cv.getJob.invalidate({ jobId: effectiveJobId });
+        }
+
         setRefinementVersion((v) => v + 1);
         getJob.refetch();
-        // Show a brief success notice
+
         setError("Previous CV restored successfully.");
         setTimeout(() => setError(null), 4000);
       },

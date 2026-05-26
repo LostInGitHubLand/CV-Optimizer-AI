@@ -5,7 +5,7 @@ import {
   buildWriterSystemRules,
   buildRefinementSystemRules,
 } from "../../../api/agents/core-rules";
-import { fallbackExtraction } from "../../../api/agents/fetcher00";
+import { fallbackExtraction } from "../../../api/agents/fetcher";
 import { runRuleBasedAnalysis } from "../../../api/agents/analyst";
 import { createMockLogger } from "../../helpers/mock-logger";
 
