@@ -13,6 +13,7 @@ import AgentProgress from "@/components/AgentProgress";
 import ResultsDisplay from "@/components/ResultsDisplay";
 import RefinementPanel from "@/components/RefinementPanel";
 import { setActiveJob, getActiveJob, clearActiveJob, hasActiveJob } from "@/lib/sessionMemory";
+import logo from "./logo.png";
 
 type InputMode = "pdf" | "url";
 
@@ -257,11 +258,16 @@ export default function Home() {
       <div className="relative z-10">
         <header className="border-b border-cyan-500/10 backdrop-blur-sm bg-[#0a0a1a]/50">
           <div className="max-w-7xl mx-auto px-4 py-4 flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center shadow-lg shadow-cyan-500/20">
-                <Sparkles className="w-5 h-5 text-white" />
-              </div>
-              <div>
+           <div className="flex items-center gap-3">
+            <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center shadow-[0_0_20px_rgba(34,211,238,0.35)]">
+              <img
+                src={logo}
+                className="w-full h-full object-cover scale-125"
+                alt="logo"
+              />
+            </div>
+
+            <div>
                 <h1 className="text-lg font-bold neon-text tracking-tight">CV Optimizer AI</h1>
                 <p className="text-xs text-slate-400">AI-Powered CV Tailoring</p>
               </div>
