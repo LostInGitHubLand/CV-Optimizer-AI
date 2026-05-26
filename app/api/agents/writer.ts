@@ -1694,9 +1694,41 @@ RULES:
   const response = await queryOllama({ prompt: userPrompt, system: systemPrompt, model: "qwen3", temperature: 0.3, unloadAfter: true, log, onTokens });
   const rawText = typeof response === "string" ? response : JSON.stringify(response);
   const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error("[WRITER] No JSON in refine response");
-  const result = JSON.parse(jsonMatch[0]);
-  if (!result.markdown || !result.jsonCv) throw new Error("[WRITER] Refine response missing fields");
+  if (!jsonMatch) {
+    throw new Error("[WRITER] No JSON in refine response");
+  }
+
+  let result: { markdown: string; jsonCv: JsonCv };
+
+  const raw = jsonMatch[0];
+
+  try {
+    result = JSON.parse(raw);
+  } catch (err1) {
+    try {
+      // 🔧 Clean pass 1: remove control chars
+      let cleaned = raw.replace(/[\x00-\x1f]/g, "");
+
+      // 🔧 Clean pass 2: escape dangerous characters inside strings
+      cleaned = cleaned
+        .replace(/\r/g, "\\r")
+        .replace(/\n/g, "\\n")
+        .replace(/\t/g, "\\t");
+
+      // 🔧 Clean pass 3: fix stray backslashes
+      cleaned = cleaned.replace(/\\(?!["\\/bfnrtu])/g, "\\\\");
+
+      result = JSON.parse(cleaned);
+    } catch (err2) {
+      throw new Error(
+        `[WRITER] JSON parse failed after cleaning.\nOriginal error: ${err1}\nCleaned error: ${err2}`
+      );
+    }
+  }
+
+if (!result.markdown || !result.jsonCv) {
+  throw new Error("[WRITER] Refine response missing fields");
+}
 
   const sanitized = sanitizeJsonCv(result.jsonCv);
 
